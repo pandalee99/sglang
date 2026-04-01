@@ -53,7 +53,11 @@ def is_blocks(n: str, m) -> bool:
 
 @dataclass
 class LTX2ArchConfig(DiTArchConfig):
-    """Architecture configuration for LTX-2 Video Transformer."""
+    """Architecture configuration for LTX-2 Video Transformer.
+
+    Supports both LTX-2 (19B, V1) and LTX-2.3 (22B, V2) models.
+    Version detection is automatic based on checkpoint config.
+    """
 
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks])
 
@@ -82,6 +86,9 @@ class LTX2ArchConfig(DiTArchConfig):
             # HF: scale_shift_table_a2v_ca_video -> SGLang: video_a2v_cross_attn_scale_shift_table
             r"(.*)scale_shift_table_a2v_ca_video": r"\1video_a2v_cross_attn_scale_shift_table",
             r"(.*)scale_shift_table_a2v_ca_audio": r"\1audio_a2v_cross_attn_scale_shift_table",
+            # V2 (LTX-2.3) specific: Prompt AdaLN for cross-attention modulation
+            r"^prompt_time_embed\.(.*)$": r"prompt_adaln_single.\1",
+            r"^audio_prompt_time_embed\.(.*)$": r"audio_prompt_adaln_single.\1",
         }
     )
 
@@ -124,6 +131,11 @@ class LTX2ArchConfig(DiTArchConfig):
     rope_type: LTX2RopeType = LTX2RopeType.INTERLEAVED
     double_precision_rope: bool = False
 
+    # V2 (LTX-2.3) specific configuration
+    # These are auto-detected from checkpoint config
+    cross_attention_adaln: bool = False  # V2: modulates cross-attention with sigma
+    caption_proj_before_connector: bool = False  # V2: projection in feature extractor
+
     # Video parameters
     num_attention_heads: int = 32
     attention_head_dim: int = 128
@@ -165,6 +177,15 @@ class LTX2ArchConfig(DiTArchConfig):
         )
         if self.audio_positional_embedding_max_pos is None:
             self.audio_positional_embedding_max_pos = [20]
+
+    @property
+    def adaln_embedding_coefficient(self) -> int:
+        """Number of AdaLN modulation parameters per transformer block.
+
+        V1 (LTX-2): 6 params (shift, scale, gate for self-attn and feedforward)
+        V2 (LTX-2.3): 9 params (6 base + 3 for cross-attention: shift_q, scale_q, gate)
+        """
+        return 9 if self.cross_attention_adaln else 6
 
 
 @dataclass

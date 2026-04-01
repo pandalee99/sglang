@@ -85,6 +85,54 @@ def apply_split_rotary_emb(
     return out.to(dtype=x_dtype)
 
 
+def apply_cross_attention_adaln(
+    x: torch.Tensor,
+    context: torch.Tensor,
+    attn_fn,
+    q_shift: torch.Tensor,
+    q_scale: torch.Tensor,
+    q_gate: torch.Tensor,
+    prompt_scale_shift_table: torch.Tensor,
+    prompt_timestep: torch.Tensor,
+    context_mask: torch.Tensor | None,
+    norm_eps: float = 1e-6,
+) -> torch.Tensor:
+    """Apply cross-attention with AdaLN modulation (LTX-2.3/V2 feature).
+
+    In V2, cross-attention is modulated by sigma via prompt AdaLN:
+    - Query (x) is modulated by shift_q, scale_q from timestep embedding
+    - Context is modulated by shift_kv, scale_kv from prompt timestep embedding
+    - Output is gated by q_gate
+
+    Args:
+        x: Query tensor [B, S, D]
+        context: Context tensor (encoder hidden states) [B, T, C]
+        attn_fn: Attention function (self.attn2 or similar)
+        q_shift, q_scale, q_gate: AdaLN params for query from timestep embedding
+        prompt_scale_shift_table: Per-block learnable params [2, D]
+        prompt_timestep: Timestep embedding for prompt modulation [B, 1, 2*D]
+        context_mask: Optional attention mask
+        norm_eps: Epsilon for RMS norm
+    """
+    batch_size = x.shape[0]
+
+    # Compute shift/scale for context from prompt_timestep + per-block table
+    # prompt_scale_shift_table: [2, D], prompt_timestep: [B, seq, 2*D]
+    shift_kv, scale_kv = (
+        prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
+        + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
+    ).unbind(dim=2)
+
+    # Apply modulation to query
+    attn_input = rms_norm(x, norm_eps) * (1 + q_scale) + q_shift
+
+    # Apply modulation to context (key/value)
+    encoder_hidden_states = context * (1 + scale_kv) + shift_kv
+
+    # Run attention and apply output gate
+    return attn_fn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
+
+
 # ==============================================================================
 # Layers and Embeddings
 # ==============================================================================
@@ -689,6 +737,7 @@ class LTX2TransformerBlock(nn.Module):
         audio_cross_attention_dim: int,
         qk_norm: bool = True,
         norm_eps: float = 1e-6,
+        cross_attention_adaln: bool = False,  # V2 (LTX-2.3) feature
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
@@ -696,6 +745,7 @@ class LTX2TransformerBlock(nn.Module):
         super().__init__()
         self.idx = idx
         self.norm_eps = norm_eps
+        self.cross_attention_adaln = cross_attention_adaln
 
         # 1. Self-Attention (video and audio)
         self.attn1 = LTX2Attention(
@@ -774,14 +824,21 @@ class LTX2TransformerBlock(nn.Module):
         )
 
         # 5. Modulation Parameters
-        self.scale_shift_table = nn.Parameter(torch.randn(6, dim) / dim**0.5)
+        # V1 (LTX-2): 6 params; V2 (LTX-2.3): 9 params (extra 3 for cross-attention)
+        sst_size = 9 if cross_attention_adaln else 6
+        self.scale_shift_table = nn.Parameter(torch.randn(sst_size, dim) / dim**0.5)
         self.audio_scale_shift_table = nn.Parameter(
-            torch.randn(6, audio_dim) / audio_dim**0.5
+            torch.randn(sst_size, audio_dim) / audio_dim**0.5
         )
         self.video_a2v_cross_attn_scale_shift_table = nn.Parameter(torch.randn(5, dim))
         self.audio_a2v_cross_attn_scale_shift_table = nn.Parameter(
             torch.randn(5, audio_dim)
         )
+
+        # V2 (LTX-2.3): Per-block prompt modulation tables for cross-attention
+        if cross_attention_adaln:
+            self.prompt_scale_shift_table = nn.Parameter(torch.randn(2, dim))
+            self.audio_prompt_scale_shift_table = nn.Parameter(torch.randn(2, audio_dim))
 
     def get_ada_values(
         self,
@@ -822,6 +879,9 @@ class LTX2TransformerBlock(nn.Module):
         audio_encoder_attention_mask: Optional[torch.Tensor] = None,
         a2v_cross_attention_mask: Optional[torch.Tensor] = None,
         v2a_cross_attention_mask: Optional[torch.Tensor] = None,
+        # V2 (LTX-2.3): Prompt timestep for cross-attention AdaLN modulation
+        prompt_timestep: Optional[torch.Tensor] = None,
+        audio_prompt_timestep: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         batch_size = hidden_states.size(0)
@@ -848,21 +908,62 @@ class LTX2TransformerBlock(nn.Module):
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * agate_msa
 
         # 2. Prompt Cross-Attention
-        norm_hidden_states = rms_norm(hidden_states, self.norm_eps)
-        attn_hidden_states = self.attn2(
-            norm_hidden_states,
-            context=encoder_hidden_states,
-            mask=encoder_attention_mask,
-        )
-        hidden_states = hidden_states + attn_hidden_states
+        if self.cross_attention_adaln and prompt_timestep is not None:
+            # V2 (LTX-2.3): Apply cross-attention with AdaLN modulation
+            # Get shift_q, scale_q, gate from scale_shift_table indices 6:9
+            vshift_ca, vscale_ca, vgate_ca = self.get_ada_values(
+                self.scale_shift_table, batch_size, temb, slice(6, 9)
+            )
+            attn_hidden_states = apply_cross_attention_adaln(
+                hidden_states,
+                encoder_hidden_states,
+                lambda x, context, mask: self.attn2(x, context=context, mask=mask),
+                vshift_ca,
+                vscale_ca,
+                vgate_ca,
+                self.prompt_scale_shift_table,
+                prompt_timestep,
+                encoder_attention_mask,
+                self.norm_eps,
+            )
+            hidden_states = hidden_states + attn_hidden_states
+        else:
+            # V1 (LTX-2): Simple cross-attention without AdaLN modulation
+            norm_hidden_states = rms_norm(hidden_states, self.norm_eps)
+            attn_hidden_states = self.attn2(
+                norm_hidden_states,
+                context=encoder_hidden_states,
+                mask=encoder_attention_mask,
+            )
+            hidden_states = hidden_states + attn_hidden_states
 
-        norm_audio_hidden_states = rms_norm(audio_hidden_states, self.norm_eps)
-        attn_audio_hidden_states = self.audio_attn2(
-            norm_audio_hidden_states,
-            context=audio_encoder_hidden_states,
-            mask=audio_encoder_attention_mask,
-        )
-        audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
+        if self.cross_attention_adaln and audio_prompt_timestep is not None:
+            # V2 (LTX-2.3): Apply cross-attention with AdaLN modulation for audio
+            ashift_ca, ascale_ca, agate_ca = self.get_ada_values(
+                self.audio_scale_shift_table, batch_size, temb_audio, slice(6, 9)
+            )
+            attn_audio_hidden_states = apply_cross_attention_adaln(
+                audio_hidden_states,
+                audio_encoder_hidden_states,
+                lambda x, context, mask: self.audio_attn2(x, context=context, mask=mask),
+                ashift_ca,
+                ascale_ca,
+                agate_ca,
+                self.audio_prompt_scale_shift_table,
+                audio_prompt_timestep,
+                audio_encoder_attention_mask,
+                self.norm_eps,
+            )
+            audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
+        else:
+            # V1 (LTX-2): Simple cross-attention without AdaLN modulation
+            norm_audio_hidden_states = rms_norm(audio_hidden_states, self.norm_eps)
+            attn_audio_hidden_states = self.audio_attn2(
+                norm_audio_hidden_states,
+                context=audio_encoder_hidden_states,
+                mask=audio_encoder_attention_mask,
+            )
+            audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
 
         # 3. Audio-to-Video and Video-to-Audio Cross-Attention
         norm_hidden_states = rms_norm(hidden_states, self.norm_eps)
@@ -1055,6 +1156,14 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.audio_num_attention_heads = arch.audio_num_attention_heads
         self.norm_eps = arch.norm_eps
 
+        # V2 (LTX-2.3) detection from HF config
+        self.cross_attention_adaln = bool(
+            hf_config.get("cross_attention_adaln", arch.cross_attention_adaln)
+        )
+        self.caption_proj_before_connector = bool(
+            hf_config.get("caption_proj_before_connector", arch.caption_proj_before_connector)
+        )
+
         tp_size = get_tp_world_size()
         self._validate_tp_config(arch=arch, tp_size=tp_size)
 
@@ -1076,20 +1185,36 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # 2. Prompt embeddings
-        self.caption_projection = LTX2TextProjection(
-            in_features=arch.caption_channels, hidden_size=self.hidden_size
-        )
-        self.audio_caption_projection = LTX2TextProjection(
-            in_features=arch.caption_channels, hidden_size=self.audio_hidden_size
-        )
+        # V2 (LTX-2.3): caption_projection is in feature extractor, not transformer
+        if not self.caption_proj_before_connector:
+            self.caption_projection = LTX2TextProjection(
+                in_features=arch.caption_channels, hidden_size=self.hidden_size
+            )
+            self.audio_caption_projection = LTX2TextProjection(
+                in_features=arch.caption_channels, hidden_size=self.audio_hidden_size
+            )
+        else:
+            self.caption_projection = None
+            self.audio_caption_projection = None
 
         # 3. Timestep Modulation Params and Embedding
+        # V1: 6 params; V2: 9 params (extra 3 for cross-attention)
+        adaln_coeff = 9 if self.cross_attention_adaln else 6
         self.adaln_single = LTX2AdaLayerNormSingle(
-            self.hidden_size, embedding_coefficient=6
+            self.hidden_size, embedding_coefficient=adaln_coeff
         )
         self.audio_adaln_single = LTX2AdaLayerNormSingle(
-            self.audio_hidden_size, embedding_coefficient=6
+            self.audio_hidden_size, embedding_coefficient=adaln_coeff
         )
+
+        # V2 (LTX-2.3): Prompt AdaLN for cross-attention modulation
+        if self.cross_attention_adaln:
+            self.prompt_adaln_single = LTX2AdaLayerNormSingle(
+                self.hidden_size, embedding_coefficient=2
+            )
+            self.audio_prompt_adaln_single = LTX2AdaLayerNormSingle(
+                self.audio_hidden_size, embedding_coefficient=2
+            )
 
         # Global Cross Attention Modulation Parameters
         self.av_ca_video_scale_shift_adaln_single = LTX2AdaLayerNormSingle(
@@ -1218,6 +1343,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     audio_cross_attention_dim=arch.audio_cross_attention_dim,
                     norm_eps=self.norm_eps,
                     qk_norm=True,  # Always True in LTX2
+                    cross_attention_adaln=self.cross_attention_adaln,  # V2 feature
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=config.prefix,
                     quant_config=quant_config,
@@ -1387,10 +1513,29 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # 4. Prepare prompt embeddings
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        audio_encoder_hidden_states = self.audio_caption_projection(
-            audio_encoder_hidden_states
-        )
+        # V2 (LTX-2.3): caption_projection is in feature extractor, not transformer
+        if self.caption_projection is not None:
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        if self.audio_caption_projection is not None:
+            audio_encoder_hidden_states = self.audio_caption_projection(
+                audio_encoder_hidden_states
+            )
+
+        # V2 (LTX-2.3): Compute prompt timestep for cross-attention AdaLN modulation
+        prompt_timestep = None
+        audio_prompt_timestep = None
+        if self.cross_attention_adaln:
+            prompt_timestep, _ = self.prompt_adaln_single(
+                timestep.flatten(),
+            )
+            prompt_timestep = prompt_timestep.view(batch_size, -1, prompt_timestep.size(-1))
+
+            audio_prompt_timestep, _ = self.audio_prompt_adaln_single(
+                audio_timestep.flatten(),
+            )
+            audio_prompt_timestep = audio_prompt_timestep.view(
+                batch_size, -1, audio_prompt_timestep.size(-1)
+            )
 
         # 5. Run blocks
         for block in self.transformer_blocks:
@@ -1414,6 +1559,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 ca_audio_rotary_emb=ca_audio_rotary_emb,
                 encoder_attention_mask=encoder_attention_mask,
                 audio_encoder_attention_mask=audio_encoder_attention_mask,
+                # V2 (LTX-2.3): Prompt timestep for cross-attention AdaLN modulation
+                prompt_timestep=prompt_timestep,
+                audio_prompt_timestep=audio_prompt_timestep,
             )
 
         # 6. Output layers

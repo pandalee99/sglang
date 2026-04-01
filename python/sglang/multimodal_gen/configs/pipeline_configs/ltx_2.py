@@ -22,6 +22,42 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 
 
+def norm_and_concat_per_token_rms(
+    encoded_text: torch.Tensor,
+    attention_mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    V2 (LTX-2.3) per-token RMSNorm for text embeddings.
+
+    Unlike V1's aggregate normalization (pack_text_embeds), V2 performs RMSNorm
+    independently per token position, then concatenates across layers.
+
+    Args:
+        encoded_text: Shape [B, T, D, L] where L is number of layers
+        attention_mask: Shape [B, T] boolean/int mask
+        eps: Epsilon for numerical stability
+
+    Returns:
+        Normalized and flattened tensor [B, T, D * L]
+    """
+    B, T, D, L = encoded_text.shape
+
+    # Per-token RMSNorm: normalize each token independently
+    # Compute variance along the hidden dimension (D)
+    variance = torch.mean(encoded_text.float() ** 2, dim=2, keepdim=True)
+    normed = encoded_text * torch.rsqrt(variance + eps)
+
+    # Flatten layers dimension: [B, T, D, L] -> [B, T, D * L]
+    normed = normed.reshape(B, T, D * L)
+
+    # Apply mask: zero out padding positions
+    mask_3d = attention_mask.bool().unsqueeze(-1)  # [B, T, 1]
+    normed = torch.where(mask_3d, normed, torch.zeros_like(normed))
+
+    return normed.to(encoded_text.dtype)
+
+
 def pack_text_embeds(
     text_hidden_states: torch.Tensor,
     sequence_lengths: torch.Tensor,
@@ -95,12 +131,27 @@ def pack_text_embeds(
 def _gemma_postprocess_func(
     outputs: BaseEncoderOutput, text_inputs: dict
 ) -> torch.Tensor:
-    # LTX-2 requires all hidden states concatenated for the connector
+    """
+    Postprocess Gemma text encoder outputs for LTX-2 connector.
+
+    For V1 (LTX-2): Uses aggregate normalization via pack_text_embeds
+    For V2 (LTX-2.3): Uses per-token RMSNorm via norm_and_concat_per_token_rms
+
+    Version is detected via 'use_per_token_rms' flag in text_inputs, which
+    should be set when cross_attention_adaln is True in the transformer config.
+    """
     if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
         # outputs.hidden_states is a tuple of tensors
         # We need to stack them along the last dimension and pack them
         hidden_states = torch.stack(outputs.hidden_states, dim=-1)
         attention_mask = text_inputs["attention_mask"]
+
+        # V2 (LTX-2.3): Use per-token RMSNorm
+        use_per_token_rms = text_inputs.get("use_per_token_rms", False)
+        if use_per_token_rms:
+            return norm_and_concat_per_token_rms(hidden_states, attention_mask)
+
+        # V1 (LTX-2): Use aggregate normalization
         sequence_lengths = attention_mask.sum(dim=-1)
         # Assuming left padding for Gemma as per Diffusers
         return pack_text_embeds(hidden_states, sequence_lengths, padding_side="left")
@@ -223,6 +274,13 @@ class LTX2PipelineConfig(PipelineConfig):
             truncation=True,
             return_tensors="pt",
         )
+
+        # V2 (LTX-2.3): Pass flag to use per-token RMSNorm in postprocessing
+        cross_attention_adaln = getattr(
+            self.dit_config.arch_config, "cross_attention_adaln", False
+        )
+        text_inputs["use_per_token_rms"] = cross_attention_adaln
+
         return text_inputs
 
     def maybe_pack_latents(self, latents, batch_size, batch):

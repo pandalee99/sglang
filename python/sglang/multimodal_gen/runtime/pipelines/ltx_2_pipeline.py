@@ -131,6 +131,18 @@ class LTX2Pipeline(ComposedPipelineBase):
         orig = self.get_module("scheduler")
         self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(orig.config)
 
+        # V2 (LTX-2.3) detection: sync version info from transformer to pipeline config
+        transformer = self.get_module("transformer")
+        if hasattr(transformer, "cross_attention_adaln"):
+            cross_attention_adaln = getattr(transformer, "cross_attention_adaln", False)
+            # Store on pipeline config for text encoding stage to access
+            server_args.pipeline_config.dit_config.arch_config.cross_attention_adaln = (
+                cross_attention_adaln
+            )
+            logger.info(
+                f"LTX-2 version detected: {'V2 (LTX-2.3)' if cross_attention_adaln else 'V1 (LTX-2)'}"
+            )
+
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stages(
             [
