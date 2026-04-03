@@ -470,6 +470,17 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         # Conditions
                         encoder_hidden_states = batch.prompt_embeds[0]
                         audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
+
+                        # DEBUG: Print encoder_hidden_states info on first step
+                        if i == 0:
+                            print(f"\n[DEBUG] encoder_hidden_states shape: {encoder_hidden_states.shape}")
+                            print(f"[DEBUG] encoder_hidden_states mean: {encoder_hidden_states.float().mean().item():.6f}")
+                            print(f"[DEBUG] encoder_hidden_states std: {encoder_hidden_states.float().std().item():.6f}")
+                            print(f"[DEBUG] encoder_hidden_states dtype: {encoder_hidden_states.dtype}")
+                            if hasattr(batch, 'negative_prompt_embeds') and batch.negative_prompt_embeds:
+                                neg = batch.negative_prompt_embeds[0]
+                                print(f"[DEBUG] neg_encoder_hidden_states shape: {neg.shape}")
+                                print(f"[DEBUG] neg_encoder_hidden_states mean: {neg.float().mean().item():.6f}")
                         encoder_attention_mask = batch.prompt_attention_mask
 
                         # Follow ltx-pipelines structure: separate pos/neg forward passes,
@@ -484,6 +495,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 audio_encoder_hidden_states=audio_encoder_hidden_states,
                                 timestep=timestep_video,
                                 audio_timestep=timestep_audio,
+                                sigma=sigma,  # V2: pass raw sigma for prompt AdaLN
                                 encoder_attention_mask=encoder_attention_mask,
                                 audio_encoder_attention_mask=encoder_attention_mask,
                                 num_frames=latent_num_frames,
@@ -515,6 +527,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     audio_encoder_hidden_states=neg_audio_encoder_hidden_states,
                                     timestep=timestep_video,
                                     audio_timestep=timestep_audio,
+                                    sigma=sigma,  # V2: pass raw sigma for prompt AdaLN
                                     encoder_attention_mask=neg_encoder_attention_mask,
                                     audio_encoder_attention_mask=neg_encoder_attention_mask,
                                     num_frames=latent_num_frames,
@@ -558,12 +571,30 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             denoised_audio_neg = (
                                 audio_latents.float() - sigma_val * a_v_neg
                             ).to(audio_latents.dtype)
+                            # Store original cond for rescaling
+                            denoised_video_cond = denoised_video.clone()
+                            denoised_audio_cond = denoised_audio.clone()
+
+                            # Apply CFG
                             denoised_video = denoised_video + (
                                 batch.guidance_scale - 1.0
                             ) * (denoised_video - denoised_video_neg)
                             denoised_audio = denoised_audio + (
                                 batch.guidance_scale - 1.0
                             ) * (denoised_audio - denoised_audio_neg)
+
+                            # Apply rescale to prevent variance growth (matches native LTX-2)
+                            # rescale_scale=0.7 is the default in native LTX-2
+                            rescale_scale = 0.7
+                            if rescale_scale > 0:
+                                # Video rescale
+                                video_factor = denoised_video_cond.float().std() / (denoised_video.float().std() + 1e-8)
+                                video_factor = rescale_scale * video_factor + (1 - rescale_scale)
+                                denoised_video = denoised_video * video_factor
+                                # Audio rescale
+                                audio_factor = denoised_audio_cond.float().std() / (denoised_audio.float().std() + 1e-8)
+                                audio_factor = rescale_scale * audio_factor + (1 - rescale_scale)
+                                denoised_audio = denoised_audio * audio_factor
 
                         # Apply conditioning mask (keep conditioned tokens clean).
                         if (

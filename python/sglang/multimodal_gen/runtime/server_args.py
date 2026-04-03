@@ -540,11 +540,38 @@ class ServerArgs:
         # configure logger before use
         configure_logger(server_args=self)
 
+        # 0. Infer correct pipeline_config type if using base class
+        self._infer_pipeline_config()
+
         # 1. adjust parameters
         self._adjust_parameters()
 
         # 2. Validate parameters
         self._validate_parameters()
+
+    def _infer_pipeline_config(self):
+        """Infer the correct pipeline_config type from model_path if using base class.
+
+        When ServerArgs is constructed directly (not via from_dict), the default
+        pipeline_config is the base PipelineConfig class. This method detects the
+        model type from model_path and replaces it with the correct subclass.
+        """
+        from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+
+        # Only infer if using the base class and model_path is provided
+        if type(self.pipeline_config) is not PipelineConfig:
+            return
+        if not self.model_path:
+            return
+
+        # Use from_kwargs to get the correct pipeline_config type
+        try:
+            self.pipeline_config = PipelineConfig.from_kwargs({"model_path": self.model_path})
+        except Exception as e:
+            logger.warning(
+                f"Failed to infer pipeline_config from model_path: {e}. "
+                "Using default PipelineConfig."
+            )
 
         # log clean server_args
         try:

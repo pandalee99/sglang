@@ -66,6 +66,9 @@ class LTX2ArchConfig(DiTArchConfig):
             # Parameter name mappings from HuggingFace checkpoint keys to SGLang module names.
             # We use upstream variable names (patchify_proj, adaln_single) but HF uses different keys.
             #
+            # Strip model.diffusion_model. prefix (used in LTX-2.3 checkpoints)
+            r"^model\.diffusion_model\.(.*)$": r"\1",
+            #
             # HF key -> SGLang key (upstream naming)
             r"^proj_in\.(.*)$": r"patchify_proj.\1",
             r"^time_embed\.(.*)$": r"adaln_single.\1",
@@ -158,6 +161,7 @@ class LTX2ArchConfig(DiTArchConfig):
     audio_cross_attention_dim: int = 2048
     audio_positional_embedding_max_pos: list[int] | None = None
     av_ca_timestep_scale_multiplier: int = 1
+    cross_attn_timestep_scale_multiplier: int = 1000  # V2: timestep scale for cross-attention AdaLN
 
     # SGLang-specific parameters
     patch_size: tuple[int, int, int] = (1, 2, 2)

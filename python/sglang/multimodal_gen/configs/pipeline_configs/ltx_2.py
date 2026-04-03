@@ -48,11 +48,25 @@ def norm_and_concat_per_token_rms(
     variance = torch.mean(encoded_text.float() ** 2, dim=2, keepdim=True)
     normed = encoded_text * torch.rsqrt(variance + eps)
 
+    # DEBUG: Check normalization
+    print(f"[DEBUG NORM] input shape: [B={B}, T={T}, D={D}, L={L}]")
+    print(f"[DEBUG NORM] variance shape: {variance.shape}, mean: {variance.mean():.4f}")
+    print(f"[DEBUG NORM] normed (per layer) sample std: {normed[0, 0, :, 0].float().std():.4f}")  # std for first token, first layer
+
     # Flatten layers dimension: [B, T, D, L] -> [B, T, D * L]
     normed = normed.reshape(B, T, D * L)
 
     # Apply mask: zero out padding positions
+    # DEBUG: Check mask format
+    print(f"[DEBUG NORM] attention_mask shape: {attention_mask.shape}, dtype: {attention_mask.dtype}")
+    print(f"[DEBUG NORM] attention_mask unique values: {attention_mask.unique().tolist()}")
+    print(f"[DEBUG NORM] attention_mask sum: {attention_mask.sum().item()}")
+
     mask_3d = attention_mask.bool().unsqueeze(-1)  # [B, T, 1]
+    # Count unmasked tokens
+    num_unmasked = mask_3d.sum().item()
+    print(f"[DEBUG NORM] mask_3d.sum(): {num_unmasked}, total: {T}")
+
     normed = torch.where(mask_3d, normed, torch.zeros_like(normed))
 
     return normed.to(encoded_text.dtype)
@@ -146,10 +160,20 @@ def _gemma_postprocess_func(
         hidden_states = torch.stack(outputs.hidden_states, dim=-1)
         attention_mask = text_inputs["attention_mask"]
 
+        # DEBUG: Print hidden_states info before normalization
+        print(f"\n[DEBUG TEXT] hidden_states (before norm) shape: {hidden_states.shape}")
+        print(f"[DEBUG TEXT] hidden_states (before norm) mean: {hidden_states.float().mean().item():.6f}")
+        print(f"[DEBUG TEXT] hidden_states (before norm) std: {hidden_states.float().std().item():.6f}")
+
         # V2 (LTX-2.3): Use per-token RMSNorm
         use_per_token_rms = text_inputs.get("use_per_token_rms", False)
+        print(f"[DEBUG TEXT] use_per_token_rms: {use_per_token_rms}")
         if use_per_token_rms:
-            return norm_and_concat_per_token_rms(hidden_states, attention_mask)
+            result = norm_and_concat_per_token_rms(hidden_states, attention_mask)
+            print(f"[DEBUG TEXT] result (after norm) shape: {result.shape}")
+            print(f"[DEBUG TEXT] result (after norm) mean: {result.float().mean().item():.6f}")
+            print(f"[DEBUG TEXT] result (after norm) std: {result.float().std().item():.6f}")
+            return result
 
         # V1 (LTX-2): Use aggregate normalization
         sequence_lengths = attention_mask.sum(dim=-1)

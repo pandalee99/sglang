@@ -484,6 +484,98 @@ class LTX2ConnectorTransformer1d(nn.Module):
         return hidden_states, attention_mask
 
 
+def _rescale_norm(x: torch.Tensor, target_dim: int, source_dim: int) -> torch.Tensor:
+    """Rescale normalization: x * sqrt(target_dim / source_dim)."""
+    import math
+
+    return x * math.sqrt(target_dim / source_dim)
+
+
+class LTX2TextConnectorsV2(nn.Module):
+    """
+    V2 (LTX-2.3) text connectors using simple linear projections.
+
+    Unlike V1's transformer-based connectors, V2 uses direct linear projections
+    (video_aggregate_embed, audio_aggregate_embed) from the normalized text embeddings.
+    The text embeddings are pre-normalized using per-token RMSNorm in the text encoding stage.
+    """
+
+    def __init__(
+        self,
+        config: LTX2ConnectorConfig,
+    ):
+        super().__init__()
+        # Input dimension: caption_channels * text_proj_in_factor (3840 * 49 = 188160)
+        input_dim = config.caption_channels * config.text_proj_in_factor
+        self.input_dim = input_dim
+
+        # embedding_dim for _rescale_norm: Gemma hidden_size (3840), NOT flattened dim
+        # This matches ltx-core's FeatureExtractorV2 which uses gemma_text_config.hidden_size
+        self.embedding_dim = config.caption_channels
+
+        # V2 uses simple linear projections instead of transformer blocks
+        video_hidden_size = getattr(config, "video_hidden_size", 4096)
+        audio_hidden_size = getattr(config, "audio_hidden_size", 2048)
+
+        self.video_aggregate_embed = nn.Linear(input_dim, video_hidden_size, bias=True)
+        self.audio_aggregate_embed = nn.Linear(input_dim, audio_hidden_size, bias=True)
+
+    def forward(
+        self,
+        text_encoder_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        additive_mask: bool = False,
+    ):
+        """
+        Process text embeddings for V2 (LTX-2.3).
+
+        Args:
+            text_encoder_hidden_states: Pre-normalized embeddings [B, T, D] where D = 188160
+            attention_mask: Attention mask [B, T] or additive mask
+            additive_mask: Whether attention_mask is already additive
+
+        Returns:
+            video_embeds: [B, T, 4096]
+            audio_embeds: [B, T, 2048]
+            attention_mask: [B, T] binary mask
+        """
+        # Convert additive mask to binary if needed
+        if additive_mask:
+            # Additive mask has large negative values for padding
+            binary_mask = (attention_mask.squeeze(1).squeeze(1) >= -9000.0).to(
+                torch.int64
+            )
+        else:
+            binary_mask = attention_mask.to(torch.int64)
+
+        # Ensure correct dtype
+        if text_encoder_hidden_states.dtype != self.video_aggregate_embed.weight.dtype:
+            text_encoder_hidden_states = text_encoder_hidden_states.to(
+                self.video_aggregate_embed.weight.dtype
+            )
+
+        # Apply rescale normalization and linear projections
+        # CRITICAL: Use embedding_dim (Gemma hidden_size = 3840) for _rescale_norm,
+        # NOT input_dim (188160). This matches ltx-core's FeatureExtractorV2.
+        # _rescale_norm computes: x * sqrt(target_dim / source_dim)
+        v_dim = self.video_aggregate_embed.out_features
+        a_dim = self.audio_aggregate_embed.out_features
+
+        video_embeds = self.video_aggregate_embed(
+            _rescale_norm(text_encoder_hidden_states, v_dim, self.embedding_dim)
+        )
+        audio_embeds = self.audio_aggregate_embed(
+            _rescale_norm(text_encoder_hidden_states, a_dim, self.embedding_dim)
+        )
+
+        # Apply mask: zero out padding positions
+        mask_3d = binary_mask.unsqueeze(-1)  # [B, T, 1]
+        video_embeds = video_embeds * mask_3d
+        audio_embeds = audio_embeds * mask_3d
+
+        return video_embeds, audio_embeds, binary_mask
+
+
 class LTX2TextConnectors(nn.Module):
     """
     Text connector stack used by LTX 2.0 to process the packed text encoder hidden states for both the video and audio
@@ -597,4 +689,13 @@ class LTX2TextConnectors(nn.Module):
         return video_text_embedding, audio_text_embedding, new_attn_mask
 
 
-EntryClass = LTX2TextConnectors
+def get_connector_class(config: LTX2ConnectorConfig):
+    """Return the appropriate connector class based on config."""
+    use_v2 = getattr(config, "use_v2_connectors", False)
+    return LTX2TextConnectorsV2 if use_v2 else LTX2TextConnectors
+
+
+# Register both V1 and V2 connector classes
+# V1 (LTX-2): transformer-based connectors
+# V2 (LTX-2.3): simple linear projections
+EntryClass = [LTX2TextConnectors, LTX2TextConnectorsV2]

@@ -1062,8 +1062,9 @@ class LTX2TransformerBlock(nn.Module):
         audio_hidden_states = audio_hidden_states + v2a_gate * v2a_attn_hidden_states
 
         # 4. Feedforward
+        # Use slice(3, 6) to always get exactly 3 FFN params regardless of V1 (6) or V2 (9)
         vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-            self.scale_shift_table, batch_size, temb, slice(3, None)
+            self.scale_shift_table, batch_size, temb, slice(3, 6)
         )
         norm_hidden_states = (
             rms_norm(hidden_states, self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
@@ -1071,8 +1072,9 @@ class LTX2TransformerBlock(nn.Module):
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + ff_output * vgate_mlp
 
+        # Use slice(3, 6) to always get exactly 3 FFN params regardless of V1 (6) or V2 (9)
         ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
-            self.audio_scale_shift_table, batch_size, temb_audio, slice(3, None)
+            self.audio_scale_shift_table, batch_size, temb_audio, slice(3, 6)
         )
         norm_audio_hidden_states = (
             rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
@@ -1381,6 +1383,10 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.audio_out_channels = arch.audio_out_channels
         self.timestep_scale_multiplier = arch.timestep_scale_multiplier
         self.av_ca_timestep_scale_multiplier = arch.av_ca_timestep_scale_multiplier
+        # V2 (LTX-2.3): cross-attention uses sigma * cross_attn_timestep_scale_multiplier
+        self.cross_attn_timestep_scale_multiplier = float(
+            hf_config.get("cross_attn_timestep_scale_multiplier", arch.cross_attn_timestep_scale_multiplier)
+        )
 
         self.layer_names = ["transformer_blocks"]
 
@@ -1392,6 +1398,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         audio_encoder_hidden_states: torch.Tensor,
         timestep: torch.LongTensor,
         audio_timestep: Optional[torch.LongTensor] = None,
+        sigma: Optional[torch.Tensor] = None,  # V2: raw noise level for prompt AdaLN
         encoder_attention_mask: Optional[torch.Tensor] = None,
         audio_encoder_attention_mask: Optional[torch.Tensor] = None,
         num_frames: Optional[int] = None,
@@ -1522,17 +1529,24 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             )
 
         # V2 (LTX-2.3): Compute prompt timestep for cross-attention AdaLN modulation
+        # In ltx-core, prompt_adaln uses sigma (raw noise level) * cross_attn_timestep_scale_multiplier
+        # The regular adaln uses timestep which is already sigma * timestep_scale_multiplier
         prompt_timestep = None
         audio_prompt_timestep = None
         if self.cross_attention_adaln:
-            prompt_timestep, _ = self.prompt_adaln_single(
-                timestep.flatten(),
-            )
+            # Use sigma if provided, otherwise derive from timestep
+            if sigma is not None:
+                prompt_sigma = sigma.flatten() * self.cross_attn_timestep_scale_multiplier
+            else:
+                # Fallback: timestep is already scaled, so use as-is
+                # This may not be correct if timestep_scale != cross_attn_timestep_scale
+                prompt_sigma = timestep.flatten()
+
+            prompt_timestep, _ = self.prompt_adaln_single(prompt_sigma)
             prompt_timestep = prompt_timestep.view(batch_size, -1, prompt_timestep.size(-1))
 
-            audio_prompt_timestep, _ = self.audio_prompt_adaln_single(
-                audio_timestep.flatten(),
-            )
+            # Audio uses the same sigma (they share the noise schedule)
+            audio_prompt_timestep, _ = self.audio_prompt_adaln_single(prompt_sigma)
             audio_prompt_timestep = audio_prompt_timestep.view(
                 batch_size, -1, audio_prompt_timestep.size(-1)
             )
