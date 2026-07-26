@@ -32,6 +32,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_dense import (
+    LingBotVideoDensePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
@@ -89,5 +92,6 @@ __all__ = [
     "LTX23PipelineConfig",
     "LingBotWorldCausalDMDConfig",
     "LingBotWorldV2CausalDMDConfig",
+    "LingBotVideoDensePipelineConfig",
     "LingBotVideoMoEPipelineConfig",
 ]

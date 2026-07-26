@@ -69,6 +69,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_dense import (
+    LingBotVideoDensePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
@@ -134,6 +137,9 @@ from sglang.multimodal_gen.configs.sample.joy_image import (
 )
 from sglang.multimodal_gen.configs.sample.krea2 import (
     Krea2SamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.lingbot_video_dense import (
+    LingBotVideoDenseSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
@@ -1155,6 +1161,14 @@ def _register_configs():
         pipeline_config_cls=LingBotVideoMoEPipelineConfig,
         model_detectors=[
             lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
+        ],
+    )
+
+    register_configs(
+        sampling_param_cls=LingBotVideoDenseSamplingParams,
+        pipeline_config_cls=LingBotVideoDensePipelineConfig,
+        model_detectors=[
+            lambda hf_id: "lingbot-video-dense" in hf_id.lower(),
         ],
     )
 

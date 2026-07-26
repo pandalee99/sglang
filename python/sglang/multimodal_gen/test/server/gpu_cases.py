@@ -451,6 +451,22 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
+        "lingbot_video_dense_t2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-dense-1.3b",
+            modality="video",
+            num_gpus=1,
+        ),
+        # Mechanical e2e smoke only: no perf baseline yet, and the harness
+        # default prompt is not a structured-JSON caption, so quality checks
+        # are meaningless for this model.
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "lingbot_world_realtime_plastic_beach",
         DiffusionServerArgs(
             model_path="robbyant/lingbot-world-fast-diffusers",

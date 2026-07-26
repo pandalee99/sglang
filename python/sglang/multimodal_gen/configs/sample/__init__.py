@@ -4,6 +4,9 @@ from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
+from sglang.multimodal_gen.configs.sample.lingbot_video_dense import (
+    LingBotVideoDenseSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
@@ -17,5 +20,6 @@ __all__ = [
     "DiffusersGenericSamplingParams",
     "Ideogram4SamplingParams",
     "Pi05SamplingParams",
+    "LingBotVideoDenseSamplingParams",
     "LingBotVideoMoESamplingParams",
 ]
