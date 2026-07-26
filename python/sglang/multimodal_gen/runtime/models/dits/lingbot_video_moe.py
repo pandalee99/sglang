@@ -182,18 +182,35 @@ class LingBotVideoAttention(nn.Module):
 
         B, S, H, D = q.shape
         if B > 1:
-            q = q.reshape(1, B * S, H, D)
-            k = k.reshape(1, B * S, H, D)
-            v = v.reshape(1, B * S, H, D)
-            if attention_mask is not None:
-                attention_mask = attention_mask.reshape(1, 1, 1, B * S)
-
-        q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
-        k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
-
-        out = self.attn(q, k, v, attn_mask=attention_mask)
-        if B > 1:
-            out = out.reshape(B, S, H, D)
+            # (cos, sin) are laid out per token over the flattened batch, so
+            # RoPE is applied on the flattened view — but attention must NOT
+            # run on it: samples would attend across batch boundaries (the
+            # reference packed path isolates samples via varlen cu_seqlens).
+            # Attend per sample instead; B is small (e.g. batched CFG).
+            q = _apply_rotary_emb(
+                q.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
+            ).reshape(B, S, H, D)
+            k = _apply_rotary_emb(
+                k.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
+            ).reshape(B, S, H, D)
+            sample_outs = []
+            for i in range(B):
+                sample_mask = (
+                    attention_mask[i : i + 1] if attention_mask is not None else None
+                )
+                sample_outs.append(
+                    self.attn(
+                        q[i : i + 1],
+                        k[i : i + 1],
+                        v[i : i + 1],
+                        attn_mask=sample_mask,
+                    )
+                )
+            out = torch.cat(sample_outs, dim=0)
+        else:
+            q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+            k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+            out = self.attn(q, k, v, attn_mask=attention_mask)
         out = out.flatten(2)
         out, _ = self.to_out(out)
         return out
@@ -298,20 +315,25 @@ class LingBotVideoBlock(nn.Module):
         return x
 
 
+# Class-attribute defaults shared by every instance; the per-model config
+# merged from the checkpoint is passed to __init__ separately.
+_CONFIG_DEFAULTS = LingBotVideoMoEConfig()
+
+
 class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _no_split_modules = ("LingBotVideoBlock",)
     _keep_in_fp32_modules = tuple(LINGBOT_VIDEO_FP32_MODULES)
 
-    _fsdp_shard_conditions = LingBotVideoMoEConfig()._fsdp_shard_conditions
-    _compile_conditions = LingBotVideoMoEConfig()._compile_conditions
-    _supported_attention_backends = (
-        LingBotVideoMoEConfig()._supported_attention_backends
-    )
-    param_names_mapping = LingBotVideoMoEConfig().param_names_mapping
-    reverse_param_names_mapping = LingBotVideoMoEConfig().reverse_param_names_mapping
-    lora_param_names_mapping = LingBotVideoMoEConfig().lora_param_names_mapping
+    _fsdp_shard_conditions = _CONFIG_DEFAULTS._fsdp_shard_conditions
+    _compile_conditions = _CONFIG_DEFAULTS._compile_conditions
+    _supported_attention_backends = _CONFIG_DEFAULTS._supported_attention_backends
+    param_names_mapping = _CONFIG_DEFAULTS.param_names_mapping
+    reverse_param_names_mapping = _CONFIG_DEFAULTS.reverse_param_names_mapping
+    lora_param_names_mapping = _CONFIG_DEFAULTS.lora_param_names_mapping
 
     def to(self, *args, **kwargs):
+        # torch._C._nn._parse_to is private but is the only exact parser for
+        # .to() overloads; the reference implementation relies on it too.
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
         if dtype is None or dtype == torch.float32:
             return super().to(*args, **kwargs)
@@ -464,6 +486,9 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         joint = torch.cat([x, text], dim=1)  # [video; text]
         joint_seq_len = joint.shape[1]
 
+        # TODO: cache per (text_len, grid) — the table is rebuilt for every
+        # sample on every forward call (40+ denoising steps reuse the same
+        # positions).
         rotary_parts = [
             self.rotary_emb.forward_uncached(
                 make_joint_position_ids(text_lens_list[i], gt, gh, gw, device)

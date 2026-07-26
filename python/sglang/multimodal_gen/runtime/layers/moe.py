@@ -130,6 +130,30 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             self.shared_experts = LingBotVideoMLP(
                 hidden_size, intermediate_size * n_shared_experts
             )
+        # Fused w13 cache (reference `_get_sglang_w13`): rebuilding the
+        # ~0.8GB cat per forward call dominated the MoE step cost. The
+        # data_ptr key invalidates the cache whenever the weights move
+        # (reload, offload re-upload). Note: with layerwise offload the key
+        # changes on every re-upload, so the cache degrades to the old
+        # per-call behavior instead of accumulating stale copies.
+        self._w13_cache: torch.Tensor | None = None
+        self._w13_cache_key: tuple | None = None
+
+    def _get_fused_w13(self) -> torch.Tensor:
+        key = (
+            self.experts.w1.data_ptr(),
+            self.experts.w3.data_ptr(),
+            self.experts.w1.device,
+            self.experts.w3.device,
+            self.experts.w1.dtype,
+            self.experts.w3.dtype,
+        )
+        if self._w13_cache is None or self._w13_cache_key != key:
+            self._w13_cache = torch.cat(
+                (self.experts.w1.bfloat16(), self.experts.w3.bfloat16()), dim=1
+            ).contiguous()
+            self._w13_cache_key = key
+        return self._w13_cache
 
     def _run_sglang_triton_experts(
         self,
@@ -163,12 +187,13 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             routed_scaling_factor=None,
             gate_up_interleaved=False,
         )
-        w13 = torch.cat((self.experts.w1, self.experts.w3), dim=1).contiguous()
-        w2 = self.experts.w2.contiguous()
+        w13 = self._get_fused_w13()
+        # No-ops when the weights are already contiguous bf16.
+        w2 = self.experts.w2.bfloat16().contiguous()
         return fused_experts(
             tokens.contiguous().bfloat16(),
-            w13.bfloat16(),
-            w2.bfloat16(),
+            w13,
+            w2,
             topk_output,
             runner_config,
         ).type_as(tokens)

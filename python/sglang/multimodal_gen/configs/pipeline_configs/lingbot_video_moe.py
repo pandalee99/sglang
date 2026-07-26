@@ -51,6 +51,9 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     precision: str = "bf16"
     vae_precision: str = "bf16"
     should_use_guidance: bool = True
+    # Kept aligned with guidance_scale for consistency; the LingBot DiT has
+    # no embedded-guidance input, so the tensor DenoisingStage builds from
+    # this lands in the forward's **kwargs and is ignored.
     embedded_cfg_scale: float = 6.0
 
     def __post_init__(self):

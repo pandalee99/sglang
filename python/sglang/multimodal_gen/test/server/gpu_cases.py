@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -64,6 +65,60 @@ from sglang.multimodal_gen.test.test_utils import (
 )
 
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
+
+# Compact schema-faithful structured caption for the LingBot-Video case: the
+# DiT consumes serialized caption JSON (raw free-text is out-of-distribution).
+# Action timestamps span 1s to match 17 frames @ 16 fps.
+LINGBOT_VIDEO_T2V_CI_PROMPT = json.dumps(
+    {
+        "comprehensive_description": {
+            "scene_content_description": (
+                "A small silver robot arm on a white table slowly reaches "
+                "toward a red cube. The background is a plain, softly lit "
+                "laboratory wall."
+            ),
+            "camera_movement_description": (
+                "The camera is static at eye level, medium shot, with the "
+                "robot arm centered and in sharp focus."
+            ),
+        },
+        "camera_info": {
+            "color": "Neutral",
+            "frame_size": "Medium",
+            "shot_type_angle": "Eye level",
+            "lens_size": "Medium",
+            "composition": "Center",
+            "lighting": "Soft light",
+            "lighting_type": "Artificial light",
+        },
+        "world_knowledge": [],
+        "prominent_elements": [
+            {
+                "name": "robot arm",
+                "description": "A small silver robot arm with a two-finger gripper.",
+                "actions": [
+                    {
+                        "timestamp": "[0.0s - 1.0s]",
+                        "action": "reaches toward the red cube",
+                    }
+                ],
+                "location": "center of the frame",
+                "relative_size": "dominant",
+                "shape_and_color": "articulated silver metal arm",
+                "texture": "brushed metal",
+                "appearance_details": "two-finger gripper, visible joints",
+                "relationship": "reaching toward the red cube on the table",
+                "orientation": "upright, base on the table",
+                "pose": "reaching",
+                "expression": "",
+                "clothing": "",
+                "gender": "",
+                "skin_tone_and_texture": "",
+            }
+        ],
+    },
+    separators=(",", ":"),
+)
 
 
 # All test cases with clean default values
@@ -449,6 +504,31 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_video_moe_t2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-moe-30b-a3b",
+            modality="video",
+            num_gpus=1,
+            text_encoder_cpu_offload=True,
+        ),
+        # Short e2e smoke with an in-distribution structured caption; no perf
+        # baseline yet. Real output-quality verification lives in
+        # test/scripts/lingbot_video_quality_check.py (non-noise heuristics +
+        # optional diffusers-reference comparison).
+        DiffusionSamplingParams(
+            prompt=LINGBOT_VIDEO_T2V_CI_PROMPT,
+            output_size="384x640",
+            num_frames=17,
+            fps=16,
+            extras={"num_inference_steps": 12, "seed": 0},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
         "lingbot_world_realtime_plastic_beach",

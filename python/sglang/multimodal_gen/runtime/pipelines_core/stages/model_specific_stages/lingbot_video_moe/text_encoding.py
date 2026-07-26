@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# Reference parity (lingbot_video/pipeline_lingbot_video.py): TOKEN_LENGTH is
+# the Qwen3-VL truncation budget for structured-JSON captions; skip layer 0
+# means the last hidden state.
 TOKEN_LENGTH = 37698
 HIDDEN_STATE_SKIP_LAYER = 0
 

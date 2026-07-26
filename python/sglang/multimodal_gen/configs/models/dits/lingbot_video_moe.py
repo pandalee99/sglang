@@ -40,6 +40,9 @@ class LingBotVideoMoEArchConfig(DiTArchConfig):
     num_experts_per_tok: int = 8
     moe_intermediate_size: int = 768
     decoder_sparse_step: int = 1
+    # Declared so a checkpoint config.json without the key still loads with
+    # no MLP-only overrides (released checkpoints always carry it).
+    mlp_only_layers: tuple[int, ...] = ()
     n_shared_experts: int = 1
     score_func: str = "sigmoid"
     norm_topk_prob: bool = True
