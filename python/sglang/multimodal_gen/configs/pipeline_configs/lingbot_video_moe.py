@@ -53,6 +53,19 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
 
+    # --- Refiner (the MoE package's refiner/ DiT; opt-in, ~60GB weights) ---
+    # A super-resolution second pass: decode, bicubic-upscale the pixels,
+    # VAE re-encode, flow-noise to refiner_t_thresh, then a short truncated
+    # sigma schedule. Defaults mirror the reference runner CLI defaults.
+    load_refiner: bool = False
+    refiner_height: int = 1088
+    refiner_width: int = 1920
+    refiner_num_inference_steps: int = 8
+    refiner_guidance_scale: float = 3.0
+    refiner_flow_shift: float = 3.0
+    refiner_t_thresh: float = 0.85
+    refiner_sigma_tail_steps: int = 2
+
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
