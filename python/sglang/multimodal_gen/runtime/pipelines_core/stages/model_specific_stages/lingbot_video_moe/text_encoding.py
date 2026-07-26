@@ -4,6 +4,12 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.ti2v import (
+    condition_pixel_to_vlm_image,
+    preprocess_condition_pixel,
+    should_apply_lingbot_ti2v,
+    vision_patch_factor,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -33,7 +39,12 @@ VIDEO_PROMPT_TEMPLATE = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
 class LingBotVideoTextEncodingStage(TextEncodingStage):
-    """Qwen3-VL prompt/negative encoding for LingBot-Video MoE (T2V, base)."""
+    """Qwen3-VL prompt/negative encoding for LingBot-Video.
+
+    T2V encodes text only. TI2V additionally feeds the condition frame to
+    the VLM for both the positive and the negative prompt, and stashes the
+    preprocessed pixel tensor for the denoising stage's VAE conditioning.
+    """
 
     def __init__(self, text_encoders, tokenizers, transformer):
         super().__init__(text_encoders, tokenizers)
@@ -74,15 +85,17 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
                 self._crop_start = int(prefix["input_ids"].shape[1])
         return self._crop_start
 
-    def _build_prompt_inputs(self, prompt: str | list[str]):
+    def _build_prompt_inputs(self, prompt: str | list[str], images=None):
         processor = self.tokenizers[0]
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        visual_template = IMG_PROMPT_TEMPLATE if images is not None else ""
         texts = [
-            self.apply_text_to_template(text, self.prompt_template) for text in prompts
+            self.apply_text_to_template(visual_template + text, self.prompt_template)
+            for text in prompts
         ]
         return processor(
             text=texts,
-            images=None,
+            images=images,
             videos=None,
             video_metadata=None,
             do_resize=False,
@@ -98,6 +111,7 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
         prompt: str | list[str],
         device: torch.device,
         dtype: torch.dtype,
+        images=None,
     ):
         text_encoder = self.text_encoders[0]
         if text_encoder is None or self.tokenizers[0] is None:
@@ -105,7 +119,7 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
                 "`text_encoder` and `processor` are required for encode_prompt()."
             )
 
-        inputs = self._build_prompt_inputs(prompt)
+        inputs = self._build_prompt_inputs(prompt, images=images)
         inputs = inputs.to(device)
         outputs = text_encoder(
             **inputs,
@@ -139,13 +153,29 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
 
         self.check_inputs(int(batch.height), int(batch.width), int(batch.num_frames))
 
-        prompt_embeds, prompt_mask = self._encode_prompt(batch.prompt, device, dtype)
+        # TI2V: the condition frame joins the VLM prompt (positive AND
+        # negative, like the reference pipeline) and its pixel tensor is
+        # stashed for the denoising stage's VAE first-frame conditioning.
+        images = None
+        if should_apply_lingbot_ti2v(batch, server_args):
+            pixel = preprocess_condition_pixel(
+                batch.condition_image, int(batch.height), int(batch.width)
+            )
+            batch.preprocessed_image = pixel
+            patch_factor = vision_patch_factor(
+                self.text_encoders[0], self.tokenizers[0]
+            )
+            images = [condition_pixel_to_vlm_image(pixel, patch_factor)]
+
+        prompt_embeds, prompt_mask = self._encode_prompt(
+            batch.prompt, device, dtype, images=images
+        )
         batch.prompt_embeds = [prompt_embeds]
         batch.prompt_attention_mask = prompt_mask
 
         if batch.do_classifier_free_guidance:
             negative_embeds, negative_mask = self._encode_prompt(
-                batch.negative_prompt, device, dtype
+                batch.negative_prompt, device, dtype, images=images
             )
             batch.negative_prompt_embeds = [negative_embeds]
             batch.negative_attention_mask = negative_mask

@@ -36,6 +36,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
+    TI2V_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
 )
@@ -457,9 +458,37 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             modality="video",
             num_gpus=1,
         ),
-        # Mechanical e2e smoke only: no perf baseline yet, and the harness
-        # default prompt is not a structured-JSON caption, so quality checks
-        # are meaningless for this model.
+        # Explicit text-only params: the dense config's task_type is TI2V
+        # (request-driven modes), so auto-derivation would pick the
+        # image-conditioned defaults. Mechanical e2e smoke only: no perf
+        # baseline yet, and the harness prompt is not a structured-JSON
+        # caption, so quality checks are meaningless for this model.
+        replace(
+            T2V_sampling_params,
+            output_size="384x640",
+            num_frames=17,
+            extras={"num_inference_steps": 12, "seed": 0},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_video_dense_ti2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-dense-1.3b",
+            modality="video",
+            num_gpus=1,
+        ),
+        # First-frame-conditioned smoke for the LingBot TI2V path.
+        replace(
+            TI2V_sampling_params,
+            output_size="384x640",
+            num_frames=17,
+            extras={"num_inference_steps": 12, "seed": 0},
+        ),
         run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,

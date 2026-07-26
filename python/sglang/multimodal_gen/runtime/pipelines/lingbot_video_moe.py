@@ -5,10 +5,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    DenoisingStage,
     InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
+    LingBotVideoDenoisingStage,
     LingBotVideoTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -49,9 +49,10 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
             prepare_extra_kwargs=[_flow_shift_kwarg],
         )
         self.add_stage(
-            DenoisingStage(
+            LingBotVideoDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
+                vae=self.get_module("vae"),
             ),
         )
         self.add_standard_decoding_stage()

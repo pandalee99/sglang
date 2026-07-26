@@ -91,13 +91,15 @@ class TestLingBotVideoDenseConfigs(unittest.TestCase):
         self.assertEqual(arch.routed_scaling_factor, 1.0)
         self.assertEqual(arch.mlp_only_layers, ())
 
-    def test_pipeline_config_uses_dense_dit_and_wan_vae_decoder(self):
+    def test_pipeline_config_uses_dense_dit_and_wan_vae(self):
         config = LingBotVideoDensePipelineConfig()
         self.assertIsInstance(config.dit_config, LingBotVideoDenseConfig)
-        self.assertEqual(config.task_type, ModelTaskType.T2V)
-        # __post_init__ (inherited from the MoE config) must keep the VAE
-        # decoder-only: T2V/T2I never encode pixels.
-        self.assertFalse(config.vae_config.load_encoder)
+        # One dense checkpoint serves T2V/TI2V/T2I request-driven; TI2V
+        # accepts-but-does-not-require the condition image.
+        self.assertEqual(config.task_type, ModelTaskType.TI2V)
+        # TI2V VAE-encodes the condition frame, so the dense config must
+        # re-enable the encoder the MoE (T2V) __post_init__ turns off.
+        self.assertTrue(config.vae_config.load_encoder)
         self.assertTrue(config.vae_config.load_decoder)
 
 
