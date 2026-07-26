@@ -254,6 +254,17 @@ def get_normalized_target_modules(
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
         "out_proj": "out_proj",
+        # GDN (GatedDeltaNet) checkpoint-layout projections (e.g. Qwen3.5/3.6):
+        # HF splits the fused in_proj_qkvz into in_proj_qkv + in_proj_z (or a
+        # fully split in_proj_q/k/v/z) and the fused in_proj_ba into
+        # in_proj_b + in_proj_a.
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_qkv": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
+        "in_proj_b": "in_proj_ba",
+        "in_proj_a": "in_proj_ba",
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
         "embeddings": "embed_tokens",
@@ -291,6 +302,7 @@ def get_stacked_multiply(
     stacked_rank = {
         "qkv_proj": 3,
         "in_proj_qkvz": 4,  # GDN packed input projection
+        "in_proj_ba": 2,  # GDN packed b/a per-head scalar projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
         "gate_up_proj_shared_moe": 2,
@@ -352,6 +364,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "up_proj",
         "gate_up_proj",
         "down_proj",

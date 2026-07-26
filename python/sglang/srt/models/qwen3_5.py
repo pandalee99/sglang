@@ -64,7 +64,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -885,6 +885,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
+        # M-RoPE positions are (3, seq) with section-dependent rotation. The
+        # CUDA fused QK-norm+RoPE kernel only consumes 1D positions (it would
+        # apply the temporal row to every rotary section), which silently
+        # mis-rotates vision tokens on VL checkpoints.
+        self.use_mrope = isinstance(self.rotary_emb, MRotaryEmbedding)
 
         attn_quant_config = (
             None
@@ -1134,12 +1139,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        if _is_cuda and self.attn_output_gate and not self.use_mrope:
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+        elif (
+            _is_hip or _is_xpu or _is_cpu or (_is_cuda and self.use_mrope)
+        ) and self.attn_output_gate:
+            # M-RoPE on CUDA: fuse only norm + gate (a platform-generic Triton
+            # kernel) and let rotary_emb apply the (3, seq) M-RoPE correctly.
             q, k, v, gate = self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1252,6 +1261,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         "o_proj",
         "out_proj",
         "in_proj_qkvz",
+        "in_proj_ba",
         "gate_up_proj",
         "down_proj",
         "lm_head",
@@ -1277,6 +1287,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             key_dim = config.linear_key_head_dim * config.linear_num_key_heads
             value_dim = config.linear_value_head_dim * config.linear_num_value_heads
             return config.hidden_size, key_dim * 2 + value_dim * 2
+        elif module_name == "in_proj_ba":
+            # One scalar b and one scalar a per linear-attention value head.
+            return config.hidden_size, 2 * config.linear_num_value_heads
         elif module_name == "gate_up_proj":
             # MoE: shared expert uses shared_expert_intermediate_size
             # Dense: regular MLP uses intermediate_size
