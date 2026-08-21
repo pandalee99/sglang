@@ -1092,6 +1092,29 @@ class LoRAPipeline(ComposedPipelineBase):
             merge_mode,
         )
 
+    def set_lora_strength(self, strength: float, target: str = "all") -> None:
+        """
+        Retarget a loaded adapter's forward-time strength without reloading it.
+
+        Dynamic path only: a merged target would have to restore and re-add DiT
+        weights. Strength 0 disables the adapter instead of scaling it away.
+        """
+        target_modules, error = self._get_target_lora_layers(target)
+        if error:
+            logger.warning("set_lora_strength: %s", error)
+        for module_name, lora_layers_dict in target_modules:
+            if self.is_lora_merged.get(module_name, False):
+                raise ValueError(
+                    "set_lora_strength requires the dynamic LoRA path for "
+                    f"{module_name}; pass --lora-merge-mode dynamic"
+                )
+            for layer in lora_layers_dict.values():
+                if layer.lora_A is None:
+                    continue
+                layer.strength = strength
+                layer.disable_lora = strength == 0.0
+            self.cur_adapter_strength[module_name] = strength
+
     def deactivate_lora_weights(self, target: str = "all") -> None:
         """
         Disable LoRA for the specified target, regardless of whether weights were

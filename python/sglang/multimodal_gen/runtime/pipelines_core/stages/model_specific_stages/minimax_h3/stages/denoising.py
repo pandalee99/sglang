@@ -610,6 +610,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or MPS")
         device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
+        lora_strength_schedule = self._resolve_lora_strength_schedule(
+            len(sigmas_video) - 1
+        )
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
             batch,
@@ -675,7 +678,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=model,
-                    model_forward=partial(self._forward_dit, batch=batch),
+                    model_forward=partial(
+                        self._forward_dit,
+                        batch=batch,
+                        lora_strength_schedule=lora_strength_schedule,
+                    ),
                     positive=positive,
                     initial_video_rows=initial_video,
                     initial_audio_rows=initial_audio,
@@ -719,6 +726,24 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         ):
             yield
 
+    def _resolve_lora_strength_schedule(self, num_steps: int) -> list[float] | None:
+        schedule = self.server_args.minimax_h3_lora_strength_schedule
+        if schedule is None:
+            return None
+        if len(schedule) != num_steps:
+            raise ValueError(
+                "--minimax-h3-lora-strength-schedule has "
+                f"{len(schedule)} entries but the resolved schedule runs "
+                f"{num_steps} model calls"
+            )
+        pipeline = self.pipeline() if self.pipeline is not None else None
+        if pipeline is None or not pipeline.lora_layers:
+            raise ValueError(
+                "--minimax-h3-lora-strength-schedule requires a LoRA-wrapped "
+                "DiT; pass --lora-path"
+            )
+        return [float(strength) for strength in schedule]
+
     def _forward_dit(
         self,
         model: Any,
@@ -726,12 +751,19 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
+        lora_strength_schedule: list[float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
 
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             set_forward_context,
         )
+
+        if lora_strength_schedule is not None:
+            self.pipeline().set_lora_strength(
+                strength=lora_strength_schedule[step_index],
+                target="transformer",
+            )
 
         with set_forward_context(
             current_timestep=step_index,

@@ -310,6 +310,10 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
+    # Video timesteps a distilled adapter was trained on, on the 0-1000 scale.
+    minimax_h3_pinned_timesteps: list[float] | None = None
+    # Per-step LoRA strength across the denoise loop, one entry per model call.
+    minimax_h3_lora_strength_schedule: list[float] | None = None
     # Per-component transformer weight overrides (key = model_index.json component name).
     # Pipelines use this when a checkpoint ships separate quantized weights for
     # secondary DiT components; the generic loader consumes it without model-specific
@@ -570,6 +574,8 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_direct_gpu_weight_loading()
         if self.lora_alpha is not None and self.lora_alpha <= 0:
             raise ValueError("lora_alpha must be a positive integer")
+        self._validate_minimax_h3_pinned_timesteps()
+        self._validate_minimax_h3_lora_strength_schedule()
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
@@ -1764,6 +1770,34 @@ class ServerArgs(DisaggServerArgsMixin):
                 "for. The default 4 covers every task; a deployment serving "
                 "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
                 "A request exceeding it is rejected rather than truncated."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-pinned-timesteps",
+            type=float,
+            nargs="+",
+            default=ServerArgs.minimax_h3_pinned_timesteps,
+            help=(
+                "Video timesteps a distilled MiniMax H3 adapter was trained on, "
+                "on the 0-1000 scale and strictly descending from 1000 (e.g. "
+                "1000 972.973 923.077 800 for the published 4-step turbo grid). "
+                "Serving these replaces the shift-derived schedule, so "
+                "num_inference_steps is ignored and the entry count is the "
+                "number of model calls. The audio grid stays derived from the "
+                "audio shift; pinning it separately desynchronizes the two "
+                "streams."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-lora-strength-schedule",
+            type=float,
+            nargs="+",
+            default=ServerArgs.minimax_h3_lora_strength_schedule,
+            help=(
+                "Per-step MiniMax H3 LoRA strength, one entry per model call "
+                "(e.g. 1 1 1 1 0 0 0 0 keeps the turbo adapter on for the "
+                "first half of an 8-step schedule). Requires --lora-path; the "
+                "entry count must match the resolved step count."
             ),
         )
         parser.add_argument(
@@ -3174,6 +3208,58 @@ class ServerArgs(DisaggServerArgsMixin):
             )
         if self.tp_size != 1:
             raise ValueError("--direct-gpu-weight-loading requires --tp-size 1")
+
+    def _validate_minimax_h3_pinned_timesteps(self) -> None:
+        # Rejected here rather than on the first request: the schedule is a
+        # startup contract and the DiT is loaded before any request arrives.
+        timesteps = self.minimax_h3_pinned_timesteps
+        if timesteps is None:
+            return
+        if not timesteps:
+            raise ValueError(
+                "--minimax-h3-pinned-timesteps must have at least one entry"
+            )
+        if any(
+            not math.isfinite(value) or not 0.0 <= value <= 1000.0
+            for value in timesteps
+        ):
+            raise ValueError(
+                "--minimax-h3-pinned-timesteps entries must be finite and "
+                "within [0, 1000]"
+            )
+        if timesteps[0] != 1000.0:
+            raise ValueError(
+                "--minimax-h3-pinned-timesteps must start at 1000; rectified "
+                "flow integrates from pure noise"
+            )
+        if any(later >= earlier for earlier, later in zip(timesteps, timesteps[1:])):
+            raise ValueError(
+                "--minimax-h3-pinned-timesteps must be strictly descending"
+            )
+
+    def _validate_minimax_h3_lora_strength_schedule(self) -> None:
+        schedule = self.minimax_h3_lora_strength_schedule
+        if schedule is None:
+            return
+        if not schedule:
+            raise ValueError(
+                "--minimax-h3-lora-strength-schedule must have at least one entry"
+            )
+        if any(not math.isfinite(strength) for strength in schedule):
+            raise ValueError(
+                "--minimax-h3-lora-strength-schedule entries must be finite"
+            )
+        if self.lora_path is None:
+            raise ValueError("--minimax-h3-lora-strength-schedule requires --lora-path")
+        # Strength is a forward-time multiplier, so a per-step schedule can only
+        # be served by the dynamic path; merging would rewrite the DiT weights
+        # on every step.
+        if self.lora_merge_mode != "dynamic":
+            raise ValueError(
+                "--minimax-h3-lora-strength-schedule requires "
+                "--lora-merge-mode dynamic, got "
+                f"{self.lora_merge_mode!r}"
+            )
 
     def _validate_parallelism(self):
         if self.kv_gather_degree < 1:

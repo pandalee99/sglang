@@ -15,8 +15,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..constants import MINIMAX_H3_SIGMAS_EXTRA_KEY
+
+logger = init_logger(__name__)
 
 
 class MiniMaxH3TimestepPreparationStage(PipelineStage):
@@ -41,7 +44,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 f"{self.__class__.__name__} is a MiniMax H3 contract stage "
                 "and has no implementation yet."
             )
-        self._generate_sigmas_from_plan(batch, plan)
+        self._generate_sigmas_from_plan(batch, plan, server_args)
         self._publish_native_timestep_state(batch)
         return batch
 
@@ -57,6 +60,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 "and has no implementation yet."
             )
         return (
+            tuple(server_args.minimax_h3_pinned_timesteps or ()),
             batch.num_inference_steps,
             plan.flow_shift,
             plan.audio_flow_shift,
@@ -87,14 +91,55 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             dtype=torch.float32,
         )
 
-    def _generate_sigmas_from_plan(self, batch: Req, plan) -> None:
+    def _generate_sigmas_from_plan(
+        self, batch: Req, plan, server_args: ServerArgs
+    ) -> None:
         """Generate the fixed per-modality float32 time-shift schedules."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+            minimax_h3_pinned_sigmas,
             minimax_h3_time_shift_sigmas,
         )
 
         if MINIMAX_H3_SIGMAS_EXTRA_KEY in batch.extra:
             return
+        scales = self._resolved_shift_scales(plan)
+        pinned_timesteps = server_args.minimax_h3_pinned_timesteps
+        if pinned_timesteps:
+            sigmas = minimax_h3_pinned_sigmas(
+                video_timesteps=list(pinned_timesteps),
+                video_shift_scale=scales["video"],
+                audio_shift_scale=scales["audio"],
+            )
+            self._adopt_pinned_step_count(batch, num_steps=len(sigmas["video"]) - 1)
+            batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
+            return
+        requested_num_steps = self._resolved_num_steps(batch)
+        batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = {
+            modality: minimax_h3_time_shift_sigmas(
+                num_steps=requested_num_steps,
+                shift_scale=scales[modality],
+            )
+            for modality in ("video", "audio")
+        }
+
+    @staticmethod
+    def _adopt_pinned_step_count(batch: Req, *, num_steps: int) -> None:
+        requested_num_steps = batch.num_inference_steps
+        if (
+            isinstance(requested_num_steps, int)
+            and not isinstance(requested_num_steps, bool)
+            and requested_num_steps != num_steps
+        ):
+            logger.warning(
+                "Ignoring num_inference_steps=%d: --minimax-h3-pinned-timesteps "
+                "fixes the schedule at %d model calls.",
+                requested_num_steps,
+                num_steps,
+            )
+        batch.num_inference_steps = num_steps
+
+    @staticmethod
+    def _resolved_num_steps(batch: Req) -> int:
         requested_num_steps = getattr(batch, "num_inference_steps", None)
         if requested_num_steps is None:
             sampling = getattr(batch, "sampling_params", None)
@@ -110,7 +155,9 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 "num_inference_steps must be a positive integer, got "
                 f"{requested_num_steps!r}"
             )
+        return requested_num_steps
 
+    def _resolved_shift_scales(self, plan) -> dict[str, float]:
         model_scales = self.sigma_shift_scales
         if model_scales is not None and not isinstance(model_scales, Mapping):
             raise ValueError("model sigma_shift_scales must be an object")
@@ -139,7 +186,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 raise ValueError(f"{source} must be a positive finite number")
             return scale
 
-        scales = {
+        return {
             "video": resolved_scale(
                 modality="video",
                 request_value=plan.flow_shift,
@@ -151,13 +198,6 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 task_default=plan.default_audio_flow_shift,
             ),
         }
-        sigmas: dict[str, list[float]] = {}
-        for modality in ("video", "audio"):
-            sigmas[modality] = minimax_h3_time_shift_sigmas(
-                num_steps=requested_num_steps,
-                shift_scale=scales[modality],
-            )
-        batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
