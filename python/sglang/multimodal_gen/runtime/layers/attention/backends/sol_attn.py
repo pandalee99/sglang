@@ -158,6 +158,10 @@ class SolAttnImpl(AttentionImpl):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            # sm_10x fails _is_fa3_supported(), and ver=3's fallback then imports
+            # flash_attn_varlen_func from the flash_attn top level, which
+            # flash-attn 4 moved to flash_attn.cute. Healthy at load, dies mid-request.
+            ver=4 if torch.cuda.get_device_capability(query.device) >= (10, 0) else 3,
         )
         return output[0] if isinstance(output, tuple) else output
 
