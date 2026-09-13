@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
     MiniMaxH3AudioVAEConfig,
 )
@@ -27,6 +28,12 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         arch = config.arch_config
         parallel_decode_mode = config.resolved_parallel_decode_mode()
         use_tiled_decode = config.use_tiling and parallel_decode_mode == "tiled"
+        tile_size_override = envs.SGLANG_DIFFUSION_MINIMAX_H3_VAE_TILE_SIZE
+        tile_size = (
+            int(arch.vae_tile_size)
+            if tile_size_override is None
+            else int(tile_size_override)
+        )
         super().__init__(
             in_channels=3,
             out_ch=3,
@@ -73,7 +80,7 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
             and config.use_parallel_decode
             and config.use_parallel_tiling
             and bool(arch.vae_parallel_tiling),
-            tile_size=int(arch.vae_tile_size),
+            tile_size=tile_size,
             tile_overlap_min=int(arch.vae_tile_overlap_min),
             encoder_parallel=False,
             decoder_parallel=False,

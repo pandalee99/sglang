@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ASYNC_PUBLISH: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_X264_PRESET: str = ""
+    SGLANG_DIFFUSION_MINIMAX_H3_VAE_TILE_SIZE: int | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -317,6 +318,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (medium), which costs ~480 ms for a 124-frame 1344x768 clip.
     "SGLANG_DIFFUSION_MINIMAX_H3_X264_PRESET": _lazy_str(
         "SGLANG_DIFFUSION_MINIMAX_H3_X264_PRESET", ""
+    ),
+    # Override the video VAE's latent tile edge. Unset keeps the checkpoint's
+    # value (256). Decode cost tracks each rank's PADDED tile area, so it is not
+    # monotonic in this number -- measure, do not extrapolate.
+    "SGLANG_DIFFUSION_MINIMAX_H3_VAE_TILE_SIZE": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_VAE_TILE_SIZE"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
