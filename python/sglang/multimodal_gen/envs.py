@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ASYNC_PUBLISH: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_X264_PRESET: str = ""
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -302,6 +304,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adaln_proj weights; keep off until an e2e trajectory gate clears it.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
+    ),
+    # Move the publish mux off the worker forward. Measured at 1344x768 / 124
+    # frames: ~0.5 s of CPU that runs after the GPU is idle but inside the
+    # forward, so segment N+1 cannot start denoising until segment N is muxed.
+    # Off by default: with it on, output_file_paths is returned before the bytes
+    # exist, so a client must wait for the path rather than trust "completed".
+    "SGLANG_DIFFUSION_MINIMAX_H3_ASYNC_PUBLISH": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ASYNC_PUBLISH"
+    ),
+    # x264 preset for the H3 publish encode. Empty keeps ffmpeg's default
+    # (medium), which costs ~480 ms for a 124-frame 1344x768 clip.
+    "SGLANG_DIFFUSION_MINIMAX_H3_X264_PRESET": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_X264_PRESET", ""
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

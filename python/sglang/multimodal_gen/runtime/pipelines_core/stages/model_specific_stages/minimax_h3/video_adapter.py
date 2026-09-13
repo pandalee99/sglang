@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -360,6 +363,20 @@ def _probe_minimax_h3_output_fields(
     expected_size: tuple[int, int] | None = None,
 ) -> dict[str, str]:
     """Validate one final MiniMax H3 AV file and derive truthful metadata."""
+
+    # This runs in the engine process while async publish muxes on a worker
+    # thread, so the path is truthful before the bytes are and an unretried probe
+    # reports a correct clip as "moov atom not found". Waiting for EXISTENCE is
+    # sound only because that publish renames atomically -- a half-written mp4
+    # probes as a valid 1-video-0-audio file.
+    if envs.SGLANG_DIFFUSION_MINIMAX_H3_ASYNC_PUBLISH:
+        deadline = time.monotonic() + 60.0
+        while not os.path.exists(path):
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"MiniMax H3 async publish did not produce {path} within 60s"
+                )
+            time.sleep(0.005)
 
     try:
         probe = subprocess.run(

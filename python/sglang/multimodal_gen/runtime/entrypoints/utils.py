@@ -36,6 +36,7 @@ try:
 except ImportError:  # pragma: no cover
     _imageio_ffmpeg = None
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
@@ -423,6 +424,11 @@ def _try_save_cuda_video_direct(
             command += ["-vf", f"scale={output_width}:{output_height}"]
 
         command += ["-threads", str(_x264_auto_thread_count(height))]
+        # veryfast beat ffmpeg's default medium on BOTH time and size at 2K/60 here,
+        # so the preset is worth spending once the denoise loop is only ~1.3 s.
+        x264_preset = envs.SGLANG_DIFFUSION_MINIMAX_H3_X264_PRESET.strip()
+        if x264_preset:
+            command += ["-preset", x264_preset]
         if tmp_wav_path is not None:
             command += [
                 "-acodec",

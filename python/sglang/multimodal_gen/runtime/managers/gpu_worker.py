@@ -7,6 +7,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, List, Union
@@ -150,6 +151,14 @@ def _shape_label(req: Req) -> str:
     return f"{req.width}x{req.height}x{req.num_frames or 1}f"
 
 
+def _partial_publish_path(path: str) -> str:
+    # Same directory so the rename is atomic, and the ORIGINAL EXTENSION is kept:
+    # ffmpeg picks its muxer from the extension, so a ".partial" suffix would make
+    # the encode fail rather than merely be invisible.
+    head, tail = os.path.split(path)
+    return os.path.join(head, f".partial.{tail}")
+
+
 def fit_auto_residency_probe(
     req: Req,
     *,
@@ -231,6 +240,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._warmup_peak_reserved_mb = 0.0
         self._release_warmup_pool_before_serving = False
         self._runtime_peak_allocated_mb = 0.0
+        # Background publisher, created on first use; see _dispatch_save.
+        self._publish_pool: ThreadPoolExecutor | None = None
+        self._pending_publish: Future | None = None
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -1171,23 +1183,85 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def build_output_path(idx: int) -> str:
                 return req.output_file_path(num_outputs, idx)
 
-        output_batch.output_file_paths = save_outputs(
-            output_batch.output,
-            req.data_type,
-            req.fps,
-            True,
-            build_output_path,
-            audio=output_batch.audio,
-            audio_sample_rate=output_batch.audio_sample_rate,
-            output_compression=req.output_compression,
-            enable_frame_interpolation=req.enable_frame_interpolation,
-            frame_interpolation_exp=req.frame_interpolation_exp,
-            frame_interpolation_scale=req.frame_interpolation_scale,
-            frame_interpolation_model_path=req.frame_interpolation_model_path,
-            enable_upscaling=req.enable_upscaling,
-            upscaling_model_path=req.upscaling_model_path,
-            upscaling_scale=req.upscaling_scale,
+        # Bound locally, NOT read through output_batch inside the closure:
+        # _materialize_file_path_transport sets output/audio/audio_sample_rate to
+        # None right after this returns, so a deferred encode that dereferenced
+        # output_batch muxed a silent video-only file.
+        samples = output_batch.output
+        audio = output_batch.audio
+        audio_sample_rate = output_batch.audio_sample_rate
+        paths = [build_output_path(idx) for idx in range(len(samples))]
+
+        def save_with(path_for: Callable[[int], str]) -> list[str]:
+            return save_outputs(
+                samples,
+                req.data_type,
+                req.fps,
+                True,
+                path_for,
+                audio=audio,
+                audio_sample_rate=audio_sample_rate,
+                output_compression=req.output_compression,
+                enable_frame_interpolation=req.enable_frame_interpolation,
+                frame_interpolation_exp=req.frame_interpolation_exp,
+                frame_interpolation_scale=req.frame_interpolation_scale,
+                frame_interpolation_model_path=req.frame_interpolation_model_path,
+                enable_upscaling=req.enable_upscaling,
+                upscaling_model_path=req.upscaling_model_path,
+                upscaling_scale=req.upscaling_scale,
+            )
+
+        self._dispatch_save(
+            output_batch=output_batch, paths=paths, save_with=save_with
         )
+
+    def _dispatch_save(
+        self,
+        *,
+        output_batch: OutputBatch,
+        paths: list[str],
+        save_with: Callable[[Callable[[int], str]], list[str]],
+    ) -> None:
+        """Encode inline, or hand the encode to the background publisher.
+
+        save_outputs() resolves every output path before it encodes anything, so
+        the caller's paths are knowable without paying for x264. That matters
+        because this runs INSIDE the worker forward: measured at 1344x768 / 124
+        frames the encode is ~0.5 s of CPU after the GPU has gone idle, so
+        segment N+1 cannot start denoising until segment N is muxed. Hardware
+        encode is not an alternative on this box (h264_nvenc lists but
+        libnvidia-encode.so.1 is absent, so it opens zero-byte files).
+
+        Exactly one encode stays in flight: the closure keeps the sample tensors
+        alive, so an unbounded queue would hold one clip of device memory per
+        queued segment, and draining in submit order keeps files in segment order.
+
+        With the gate on, paths are returned BEFORE the bytes exist, so the
+        publish must be ATOMIC. A half-muxed mp4 is not merely unreadable --
+        ffprobe parses it as a valid 1-video-0-audio file, so a consumer polling
+        "does it probe yet" gets a confident wrong answer. Existence of the final
+        path is the only safe readiness signal.
+        """
+        if not envs.SGLANG_DIFFUSION_MINIMAX_H3_ASYNC_PUBLISH:
+            output_batch.output_file_paths = save_with(lambda idx: paths[idx])
+            return
+
+        if self._publish_pool is None:
+            self._publish_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="h3-publish"
+            )
+        if self._pending_publish is not None:
+            # Surfaces a failed encode on the next request rather than dropping it.
+            self._pending_publish.result()
+
+        def publish() -> list[str]:
+            save_with(lambda idx: _partial_publish_path(paths[idx]))
+            for path in paths:
+                os.replace(_partial_publish_path(path), path)
+            return paths
+
+        self._pending_publish = self._publish_pool.submit(publish)
+        output_batch.output_file_paths = paths
 
     def _save_group_output_paths(
         self,
