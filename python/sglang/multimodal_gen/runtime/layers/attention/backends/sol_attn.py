@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import re
 
 import torch
@@ -76,6 +77,10 @@ def _get_sol_attn_runtime_config() -> dict:
         "kv_splits": cfg.get("kv_splits", "auto"),
         "sink_tokens": int(cfg.get("sink_tokens", 0)),
         "sink_start": None if sink_start is None else int(sink_start),
+        # Default True keeps the previous unconditional behaviour; not flipped
+        # despite being a measured loss on sm_103, because sm_89/sm_120 -- where
+        # the INT8-QK port comes from -- were not measured here.
+        "int8_qk": bool(cfg.get("int8_qk", True)),
         "dense_steps": int(cfg.get("dense_steps", 10)),
         "dense_layers": _parse_layer_ranges(cfg.get("dense_layers", "0,1")),
         "dense_backend": dense_backend,
@@ -211,7 +216,15 @@ class SolAttnImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> torch.Tensor:
-        from sol_attn import sol_attn
+        # Two numerically faithful implementations (cos agrees to 5-6 digits) with
+        # different signatures: the vendored ComfyUI port adds int8_qk/int8_pv/
+        # sink_blocks and drops kv_splits/sink_tokens/sink_start. Vendored is the
+        # default because it is faster here -- measured on sm_103 at 2K, T=126480,
+        # dense 36.46ms: vendored 25.32ms (1.44x), official-triton 26.22ms (1.39x).
+        if os.environ.get("SGLANG_SOL_ATTN_OFFICIAL", "0") not in ("0", ""):
+            from sol_attn import sol_attn
+        else:
+            from sglang.kernels.ops.attention.sol_kernel import sol_attn
 
         cfg = _get_sol_attn_runtime_config()
         q = query.unsqueeze(0).contiguous()
@@ -231,9 +244,14 @@ class SolAttnImpl(AttentionImpl):
             "sink_tokens": cfg["sink_tokens"],
         }
         # Wan2GP Ada port: INT8-QK Triton; official NVlabs API has no int8_qk.
-        if "int8_qk" in self._sol_params and tuple(
-            torch.cuda.get_device_capability(q.device)
-        ) >= (8, 9):
+        # Opt-out because it is a LOSS on sm_103: 63.10ms vs 25.24ms without it
+        # against a 36.19ms dense baseline (0.58x instead of 1.44x) at identical
+        # cos_sim 0.9958; that inversion made H3's 2K denoise 51.3s vs 31.3s dense.
+        if (
+            "int8_qk" in self._sol_params
+            and cfg["int8_qk"]
+            and tuple(torch.cuda.get_device_capability(q.device)) >= (8, 9)
+        ):
             kwargs["int8_qk"] = True
         kwargs = {k: v for k, v in kwargs.items() if k in self._sol_params}
         return sol_attn(q, k, v, **kwargs).squeeze(0)

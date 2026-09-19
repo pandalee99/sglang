@@ -1,0 +1,12 @@
+sol_kernel/ vendored from https://github.com/Saganaki22/ComfyUI-sol-attn.git
+commit 930a4d6e432ff8b8ed5e30ff2f72519b92d69bdf  (tag msg "v0.6.2: add SM86 support")
+subdirectory: sol_kernel/   files copied verbatim, no edits
+
+Why vendored rather than installed: that repo carries no setup.py, pyproject.toml
+or setup.cfg at either the root or in sol_kernel/, so `pip install git+...` has no
+metadata to build from and fails outright. PyPI has neither `sol-attn` nor
+`sol_attn`, and the install hint in the SOL_ATTN resolver's own ImportError
+(NVlabs/Sana @ sol-engine) is not a fetchable source.
+
+Runtime deps are torch and triton only. Arch gate lives in fwd.py:
+SM86/89/90/100/120/121.
