@@ -20,6 +20,7 @@ Scope notes (adapt_shape_v1):
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -41,7 +42,18 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 MINIMAX_H3_SHAPE_POLICY_VERSION = "adapt_shape_v1"
 MINIMAX_H3_BASE_SHORT_EDGE = 768
-MINIMAX_H3_MAX_PIXELS = MINIMAX_H3_BASE_SHORT_EDGE * 1344
+# The soft area cap, not the short edge, is what actually pins output geometry:
+# a 16:9 request at short_edge 768, 1536 or 3072 has nominal area 1048576 /
+# 4194304 / 16777216, all above this cap, so all three scale back to exactly
+# 1344x768. Raising target.short_edge alone therefore changes nothing.
+#
+# SGLANG_H3_MAX_PIXELS_SCALE multiplies the cap for native higher-resolution
+# experiments (scale 4 => 2K, scale 16 => 4K). Unset (the default 1) reproduces
+# the shipped 768x1344 policy exactly. This is an experiment gate: the checkpoint
+# is only tuned and measured at 768, per warn_unverified_short_edge in
+# constants.py.
+_MAX_PIXELS_SCALE = float(os.environ.get("SGLANG_H3_MAX_PIXELS_SCALE", "1"))
+MINIMAX_H3_MAX_PIXELS = int(MINIMAX_H3_BASE_SHORT_EDGE * 1344 * _MAX_PIXELS_SCALE)
 MINIMAX_H3_CANVAS_MULTIPLE = 32
 MINIMAX_H3_MIN_ASPECT_RATIO = 1.0 / 4.0
 MINIMAX_H3_MAX_ASPECT_RATIO = 4.0

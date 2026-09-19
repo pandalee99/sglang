@@ -123,7 +123,10 @@ def _lazy_str(key: str, default: str | None = None) -> Callable[[], str | None]:
 def _lazy_int(key: str, default: str | int | None = None) -> Callable[[], int | None]:
     def _getter():
         val = os.getenv(key)
-        if val is None:
+        # An exported-but-empty var means unset: a launcher that always passes
+        # the var would otherwise reach int("") and fail at component load,
+        # where the ValueError names no env var.
+        if val is None or val == "":
             return int(default) if default is not None else None
         return int(val)
 
