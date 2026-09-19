@@ -31,6 +31,31 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
+def _apply_latent_upscale_to_shape(shape: dict[str, Any]) -> dict[str, Any]:
+    """Report the canvas the DECODER will produce, not the one denoise ran at.
+
+    The learned latent upscale (decoding.py:_maybe_upscale_latents) runs after
+    denoise, so the resolved plan's width/height describe the generated grid but
+    no longer the delivered file. Only the strict output checks and the queued
+    size field go through here; the plan itself stays at the denoise geometry,
+    which is the whole point of the experiment -- rewriting the plan would make
+    denoise run at 2K and cost what the upscale is meant to save.
+
+    Frame count and fps are untouched: the upscale is spatial only.
+    """
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.latent_upscale import (
+        latent_upscale_scale,
+        upscaled_pixel_size,
+    )
+
+    scale = latent_upscale_scale()
+    width, height = shape.get("width"), shape.get("height")
+    if scale <= 1.0 or width is None or height is None:
+        return shape
+    out_w, out_h = upscaled_pixel_size(int(width), int(height), scale)
+    return {**shape, "width": out_w, "height": out_h}
+
+
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
     return (request.model_extra or {}).get(name)
 
@@ -291,7 +316,7 @@ class MiniMaxH3VideoModelAdapter:
             raise ValueError(
                 "queued MiniMax H3 jobs require pre-queue resolved temporal dimensions"
             )
-        return shape
+        return _apply_latent_upscale_to_shape(shape)
 
     def project_queued_job_fields(self, batch: Req) -> dict[str, str]:
         shape = self._resolved_shape(batch)
@@ -378,18 +403,19 @@ def _probe_minimax_h3_output_fields(
                 )
             time.sleep(0.005)
 
+    probe_argv = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,nb_frames,duration,sample_rate,channels:format=format_name,duration",
+        "-of",
+        "json",
+        str(path),
+    ]
     try:
         probe = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,nb_frames,duration,sample_rate,channels:format=format_name,duration",
-                "-of",
-                "json",
-                str(path),
-            ],
+            probe_argv,
             check=True,
             capture_output=True,
             text=True,
