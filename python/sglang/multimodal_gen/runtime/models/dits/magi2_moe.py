@@ -114,14 +114,23 @@ class Magi2MultiHeadRouter(nn.Module):
             persistent=True,
         )
 
-    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        *,
+        head_range: tuple[int, int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rows are token-major so a later view collapses the head axis back into the hidden axis."""
         num_tokens = tokens.shape[0]
         heads, experts = self.num_heads, self.num_experts
+        start, stop = (0, heads) if head_range is None else head_range
+        width = stop - start
 
         with torch.amp.autocast(tokens.device.type, enabled=False):
             per_head = tokens.float().transpose(0, 1)
-            gate = self.gate.view(heads, experts, self.head_dim).transpose(1, 2)
+            gate = self.gate.view(heads, experts, self.head_dim)[start:stop].transpose(
+                1, 2
+            )
             logits = torch.bmm(per_head, gate.float())
 
         scores = (
@@ -130,21 +139,23 @@ class Magi2MultiHeadRouter(nn.Module):
             else logits.sigmoid()
         )
 
-        biased = scores + self.expert_bias.view(heads, 1, experts)
+        biased = scores + self.expert_bias.view(heads, 1, experts)[start:stop]
         topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(-1, topk_ids)
         if self.route_norm and self.top_k > 1:
             topk_weights = F.normalize(topk_weights, p=1, dim=-1, eps=ROUTE_NORM_EPS)
         topk_weights = topk_weights * self.route_scale
 
+        # Ids carry the head offset, so a caller slicing the experts rebases
+        # them by start * experts.
         head_offset = (
-            torch.arange(heads, device=tokens.device, dtype=topk_ids.dtype) * experts
-        )
-        topk_ids = topk_ids + head_offset.view(heads, 1, 1)
+            torch.arange(width, device=tokens.device, dtype=topk_ids.dtype) + start
+        ) * experts
+        topk_ids = topk_ids + head_offset.view(width, 1, 1)
 
-        topk_ids = topk_ids.transpose(0, 1).reshape(num_tokens * heads, self.top_k)
+        topk_ids = topk_ids.transpose(0, 1).reshape(num_tokens * width, self.top_k)
         topk_weights = topk_weights.transpose(0, 1).reshape(
-            num_tokens * heads, self.top_k
+            num_tokens * width, self.top_k
         )
         return topk_ids, topk_weights
 
@@ -349,13 +360,91 @@ class Magi2MultiHeadMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
+        groups = self._pipeline_groups()
+        if groups == 1:
+            owned = self._gather_owned_heads(hidden_states)
+            topk_ids, topk_weights = self.router(owned)
+            flat = owned.reshape(-1, self.head_dim)
+            out = self.experts(flat, topk_ids, topk_weights)
+            out = out.view(owned.shape[0], self.local_num_heads, self.head_dim)
+            return self._scatter_owned_heads(out, num_tokens=num_tokens)
+        return self._forward_pipelined(hidden_states, num_tokens, groups)
 
-        owned = self._gather_owned_heads(hidden_states)
-        topk_ids, topk_weights = self.router(owned)
-        flat = owned.reshape(-1, self.head_dim)
-        out = self.experts(flat, topk_ids, topk_weights)
-        out = out.view(owned.shape[0], self.local_num_heads, self.head_dim)
-        return self._scatter_owned_heads(out, num_tokens=num_tokens)
+    def _pipeline_groups(self) -> int:
+        if self.ep_size <= 1:
+            return 1
+        groups = resolve_pipeline_groups(
+            local_heads=self.local_num_heads, preferred=3, group=self.ep_group
+        )
+        # One call must stay under the kernel's expert limit, the same bound
+        # heads_per_call enforces on the sequential path.
+        while groups > 1 and (
+            self.local_num_heads % groups
+            or self.local_num_heads // groups > self.experts.heads_per_call
+        ):
+            groups -= 1
+        return groups
+
+    def _forward_pipelined(
+        self, hidden_states: torch.Tensor, num_tokens: int, groups: int
+    ) -> torch.Tensor:
+        heads = hidden_states.view(-1, self.num_heads, self.head_dim)
+        heads_per_group = self.local_num_heads // groups
+
+        gathers = []
+        for g in range(groups):
+            send_in = (
+                heads.view(
+                    num_tokens, self.ep_size, self.local_num_heads, self.head_dim
+                )[:, :, g * heads_per_group : (g + 1) * heads_per_group]
+                .transpose(0, 1)
+                .contiguous()
+            )
+            recv = torch.empty_like(send_in)
+            gathers.append(
+                (
+                    dist.all_to_all_single(
+                        recv, send_in, group=self.ep_group, async_op=True
+                    ),
+                    recv,
+                )
+            )
+
+        scatters = []
+        scattered = []
+        for g in range(groups):
+            start = g * heads_per_group
+            stop = start + heads_per_group
+            handle, recv = gathers[g]
+            handle.wait()
+            owned = recv.reshape(
+                self.ep_size * num_tokens, heads_per_group, self.head_dim
+            )
+            topk_ids, topk_weights = self.router(owned, head_range=(start, stop))
+            out = self.experts._run_head_range(
+                owned.reshape(-1, self.head_dim),
+                topk_ids.reshape(-1, topk_ids.shape[-1]),
+                topk_weights.reshape(-1, topk_weights.shape[-1]),
+                start=start,
+                stop=stop,
+            ).view(owned.shape[0], heads_per_group, self.head_dim)
+            send_out = out.view(
+                self.ep_size, num_tokens, heads_per_group, self.head_dim
+            ).contiguous()
+            recv_out = torch.empty_like(send_out)
+            scatters.append(
+                dist.all_to_all_single(
+                    recv_out, send_out, group=self.ep_group, async_op=True
+                )
+            )
+            scattered.append(recv_out)
+
+        for handle in scatters:
+            handle.wait()
+        merged = torch.cat(scattered, dim=2)
+        # recv[s] is rank s's heads for this rank's tokens; ranks own heads in
+        # ascending order, so stacking restores head order 0..H-1.
+        return merged.transpose(0, 1).contiguous().reshape(num_tokens, self.hidden_size)
 
     def _gather_owned_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Trade the sequence shard for a head shard, giving ``[num_tokens * ep_size, local_num_heads, head_dim]``."""
